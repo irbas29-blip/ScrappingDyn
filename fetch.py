@@ -7,17 +7,71 @@ import os
 import urllib.parse
 from bs4 import BeautifulSoup
 import html2text
+import requests
+import aiohttp
 from utils import save_visited_url, sanitize_filename, clean_link_fragment
 from config import TIMEOUTCALL, TIMEOUTWAIT, MAX_CONCURRENCY, UNWANTED_KEYWORDS
+from logger import setup_error_logger, log_pdf_error, log_scraping_error, log_network_error
 
+# Logger global pour ce module
+error_logger = setup_error_logger("scraper")
+
+def download_pdf_sync(url, project_dir, visited_pages):
+    """Télécharge un fichier PDF avec requests"""
+    try:
+        normalized_url = url.rstrip('/').lower()
+        if normalized_url in visited_pages:
+            return
+        
+        print(f"    📄 Téléchargement PDF: {url}")
+        
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()
+        
+        # Créer le nom de fichier
+        parsed_url = urlparse(url)
+        filename = os.path.basename(parsed_url.path)
+        if not filename.endswith('.pdf'):
+            filename = sanitize_filename(url) + '.pdf'
+        
+        # Créer le dossier PDF
+        pdf_dir = os.path.join(project_dir, "PDFs")
+        os.makedirs(pdf_dir, exist_ok=True)
+        
+        # Sauvegarder le PDF
+        file_path = os.path.join(pdf_dir, filename)
+        with open(file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        print(f"    ✅ PDF sauvé: {file_path}")
+        visited_pages.add(normalized_url)
+        save_visited_url(normalized_url)
+        
+    except requests.exceptions.RequestException as e:
+        error_msg = f"Erreur réseau PDF {url}: {type(e).__name__}: {e}"
+        print(f"    ⚠️ {error_msg}")
+        log_pdf_error(error_logger, url, str(e))
+    except OSError as e:
+        error_msg = f"Erreur fichier PDF {url}: {type(e).__name__}: {e}"
+        print(f"    ⚠️ {error_msg}")
+        log_pdf_error(error_logger, url, f"File system error: {e}")
+    except Exception as e:
+        error_msg = f"Erreur PDF {url}: {type(e).__name__}: {e}"
+        print(f"    ⚠️ {error_msg}")
+        log_pdf_error(error_logger, url, str(e))
+
+# On filtre sur les pages où il y a la balise html main et on récupère la balise de l'article uniquement div_name
+# Le résultat est transformé en markdown et enregistré dans un fod
 async def fetch_uniquepage(url, base_url, main_div_name, keep_div_name, semaphore, project_dir, visited_pages, visited_urls_from_file):
     async with semaphore:
         normalized_url = url.rstrip('/').lower()
-        if normalized_url in visited_pages:
+        if normalized_url in visited_pages or normalized_url in visited_urls_from_file:
             return []
         
-        if normalized_url in visited_pages or normalized_url in visited_urls_from_file:
-            print(f"    ❌ Already scraped (from file): {normalized_url}")
+        # Vérifier si c'est un PDF
+        if url.lower().endswith('.pdf'):
+            download_pdf_sync(url, project_dir, visited_pages)
             return []
         
         async with async_playwright() as p:
@@ -40,8 +94,13 @@ async def fetch_uniquepage(url, base_url, main_div_name, keep_div_name, semaphor
 
                 html = await page.content()
                 soup = BeautifulSoup(html, "html.parser")
-                # 🔹 Extraire uniquement les <div class="content"> dans <div data-main-column>
-                main_div = soup.find("div", class_=main_div_name)
+                
+                # Gérer les attributs data-* vs classes
+                if main_div_name.startswith('data-'):
+                    main_div = soup.find("div", attrs={main_div_name: True})
+                else:
+                    main_div = soup.find("div", class_=main_div_name)
+                
                 if main_div:
                     for tag in main_div(['script', 'style', 'nav', 'footer', 'header']):
                         tag.decompose()
@@ -49,16 +108,13 @@ async def fetch_uniquepage(url, base_url, main_div_name, keep_div_name, semaphor
                     content_blocks = main_div.find_all("div", class_=keep_div_name)
                     if content_blocks:
                         html_snippet = "\n".join(str(block) for block in content_blocks)
-                        # 🔹 Convertir en Markdown
                         converter = html2text.HTML2Text()
                         converter.ignore_links = False
                         converter.body_width = 0
                         article_md = converter.handle(html_snippet)
                         markdown_content = f"# {article_md}"
 
-                        # 🔹 Enregistrer le contenu dans un fichier Markdown
                         safe_filename = sanitize_filename(final_url)
-                        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")                
                         os.makedirs(project_dir, exist_ok=True)
                         file_path = os.path.join(project_dir, f"{safe_filename}.md")
 
@@ -68,10 +124,15 @@ async def fetch_uniquepage(url, base_url, main_div_name, keep_div_name, semaphor
 
                         print(f"    ✅ Saved: {file_path}")
                     else:
-                        print(f"    ❌ Pas de blocs .content trouvés dans data-main-column")                        
+                        error_msg = f"Pas de blocs .{keep_div_name} trouvés"
+                        print(f"    ❌ {error_msg}")
+                        log_scraping_error(error_logger, url, error_msg, "Missing content blocks")
                 else:
-                    print(f"    ❌ Aucune section data-main-column trouvée")            
+                    error_msg = f"Aucune section {main_div_name} trouvée"
+                    print(f"    ❌ {error_msg}")
+                    log_scraping_error(error_logger, url, error_msg, "Missing main container")
 
+                # Récupérer les liens
                 if base_url:
                     links = await page.evaluate('''() => {
                         const set = new Set();
@@ -86,24 +147,36 @@ async def fetch_uniquepage(url, base_url, main_div_name, keep_div_name, semaphor
 
                     filtered_links = []
                     for link in links:
-                        print(f"    Check: {link}")
                         try:
                             clean_link = clean_link_fragment(link)
                             if clean_link.startswith(base_url) \
                             and clean_link not in visited_pages \
                             and not any(k in clean_link for k in UNWANTED_KEYWORDS):
                                 filtered_links.append(clean_link)
-                        except:
+                        except Exception as e:
+                            log_scraping_error(error_logger, link, f"Link processing error: {e}", "Link filtering")
                             continue
+                    
+                    await browser.close()
                     return filtered_links
 
                 await browser.close()
 
             except Exception as e:
-                print(f"    ⚠️ Error fetching {normalized_url}: {type(e).__name__}: {e}")
+                error_msg = f"Error fetching {normalized_url}: {type(e).__name__}: {e}"
+                print(f"    ⚠️ {error_msg}")
+                
+                # Déterminer le type d'erreur
+                if "timeout" in str(e).lower() or "net::" in str(e).lower():
+                    log_network_error(error_logger, url, str(e))
+                else:
+                    log_scraping_error(error_logger, url, str(e), "General scraping error")
+                
                 await browser.close()
                 return []
 
+# fetch_pages_base : on par d'une URL de base et on scrappe tout ce qu'il y a en dessous
+# Pour chaque lien, on regarde les autres liens mentionnés, si même url de base alors à scraper
 async def fetch_pages_base(base_url, main_div_name, keep_div_name, semaphore, project_dir, visited_pages, visited_urls_from_file):
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
     print(f"\n📌 Starting scrape of: {base_url}")

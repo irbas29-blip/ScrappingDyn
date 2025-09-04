@@ -3,6 +3,7 @@ import os
 from utils import load_visited_urls, load_urls_from_csv
 from config import MAX_CONCURRENCY, URLS_FILE_PATH, OUTPUT_ROOT
 from fetch import fetch_pages_base
+from fetch_blog import fetch_blog_with_pagination  # ✅ Nouveau import
 
 
 async def main():
@@ -19,11 +20,15 @@ async def main():
         param2 = entry.get('param2', '')
         param3 = entry.get('param3', '')
 
-        project_dir = os.path.join(OUTPUT_ROOT, source.replace(" ", "_"))
+        # ✅ Sécuriser le nom du dossier
+        safe_source = source.replace("/", "_").replace("\\", "_").replace(" ", "_")
+        project_dir = os.path.join(OUTPUT_ROOT, safe_source)
 
         match type:
             case "Base":
                 await fetch_pages_base(url, param1, param2, semaphore, project_dir, visited_pages, visited_urls_from_file)
+            case "Blog":  # ✅ Nouveau case
+                await fetch_blog_with_pagination(url, param1, param2, param3, semaphore, project_dir, visited_pages, visited_urls_from_file)
             case "stop":
                 print("Stopping...")
             case "pause":
